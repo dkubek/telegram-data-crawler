@@ -4,15 +4,27 @@ TGDataset is a collection of Telegram channels that takes a snapshot of the actu
 
 The dataset size is approximately 460 GB and is available for download in its zipped version (roughly 71 GB) through the Zenodo service [here](https://zenodo.org/record/7640712#.Y-9PjNLMKXI).
 
-If you use this dataset please cite:
+If you use this dataset, please cite:
 ```
-@article{la2023tgdataset,
-  title={TGDataset: a Collection of Over One Hundred Thousand Telegram Channels},
-  author={La Morgia, Massimo and Mei, Alessandro and Mongardini, Alberto Maria},
-  journal={arXiv preprint arXiv:2303.05345},
-  year={2023}
+@inproceedings{10.1145/3690624.3709397,
+author = {La Morgia, Massimo and Mei, Alessandro and Mongardini, Alberto Maria},
+title = {TGDataset: Collecting and Exploring the Largest Telegram Channels Dataset},
+year = {2025},
+isbn = {9798400712456},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3690624.3709397},
+doi = {10.1145/3690624.3709397},
+booktitle = {Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.1},
+pages = {2325–2334},
+numpages = {10},
+keywords = {conspiracy theories, copyright infringement, dataset, telegram},
+location = {Toronto ON, Canada},
+series = {KDD '25}
 }
 ```
+
+
 
 
 ## Structure
