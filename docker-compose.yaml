@@ -3,7 +3,7 @@ version: '3.7'
 services:
 
   mongodb:
-    image: mongo
+    image: docker.io/library/mongo:latest
     container_name: TGDataset
     restart: always
     networks:

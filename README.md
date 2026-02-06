@@ -113,6 +113,101 @@ pip install -r requirements.txt
 python db_utilities.py
 ```
 
+## Creating Your Own Dataset from Seed Channels
+
+If you want to crawl Telegram channels yourself instead of using the pre-built TGDataset, follow these steps:
+
+### Step 1: Get Telegram API Credentials
+
+1. Go to [https://my.telegram.org](https://my.telegram.org)
+2. Log in with your phone number
+3. Go to "API development tools" and create a new application
+4. Note your `api_id` and `api_hash`
+
+### Step 2: Create Configuration File
+
+Create a `config.ini` file in the project root:
+
+```ini
+[Telegram]
+api_id = YOUR_API_ID
+api_hash = YOUR_API_HASH
+phone = +1234567890
+username = my_session
+```
+
+### Step 3: Prepare Seed Channels
+
+Edit `seed-channels.txt` with your seed channels (one per line). Supported formats:
+```
+# Comments start with #
+https://t.me/channelname
+@channelname
+channelname
+```
+
+### Step 4: Start MongoDB
+
+Using Docker (recommended):
+```bash
+docker-compose up -d mongodb
+```
+
+Or install MongoDB locally following the [official instructions](https://www.mongodb.com/docs/manual/administration/install-community/).
+
+### Step 5: Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 6: Run the Crawler
+
+```bash
+# Basic usage (crawls 2 degrees of separation by default)
+python crawler.py
+
+# Custom options
+python crawler.py --max-degree 3 --limit 5000
+
+# Full options
+python crawler.py --help
+```
+
+**Command-line options:**
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-d`, `--max-degree` | Maximum degrees of separation from seed channels | 2 |
+| `-s`, `--seed-file` | Path to seed channels file | seed-channels.txt |
+| `-l`, `--limit` | Maximum messages to download per channel | 10000 |
+
+### Step 7: Export the Network Graph (Optional)
+
+```python
+import db_utilities
+
+# Export to CSV (edge list)
+db_utilities.export_network('network.csv', 'Telegram')
+
+# Export to JSON with channel metadata
+db_utilities.export_network('network.json', 'Telegram', include_channel_info=True)
+
+# Export to GEXF for Gephi (requires networkx)
+db_utilities.export_network('network.gexf', 'Telegram', include_channel_info=True)
+```
+
+### How the Snowball Crawler Works
+
+1. **Degree 0**: Downloads all seed channels from `seed-channels.txt`
+2. **Degree 1**: Discovers channels from forwarded messages in seed channels
+3. **Degree 2+**: Continues discovering channels up to `--max-degree`
+4. **Network**: Stores all forwarding relationships in a `Network` collection
+
+The crawler stores:
+- **Channel collection**: Channel metadata + messages
+- **Network collection**: Directed edges (source → forwarded_from)
+- **degree**: Distance from nearest seed channel (0 = seed)
+
 # Docker
 
 ## Importing data into MongoDB
