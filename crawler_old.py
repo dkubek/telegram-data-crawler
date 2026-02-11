@@ -4,18 +4,23 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import FloodWaitError, ChannelPrivateError
 from telethon.tl import types
 
+import asyncio
+import argparse
 import time
 import datetime
 import logging
 import pickle
+from pathlib import Path
 
-from progress.bar import ChargingBar
+from tqdm import tqdm
 import configparser
 
 import db_utilities
 
 
 DB_NAME = "Telegram"
+STOP_BEFORE_UTC = datetime.datetime(2022, 1, 1, tzinfo=datetime.timezone.utc)
+STOP_BEFORE_TIMESTAMP = STOP_BEFORE_UTC.timestamp()
 
 
 ######################################################
@@ -58,6 +63,45 @@ def save_as_pickle(text_list, outfile_name):
         pickle.dump(text_list, fp)
 
 
+def parse_seed_file(path):
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+
+    usernames = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                usernames.append(line.lstrip("@"))
+
+    return usernames
+
+
+def extract_media_info(message):
+    if not message.media:
+        return None
+
+    if message.gif or message.sticker:
+        return None
+
+    if message.photo:
+        photo = message.photo
+        return {
+            "title": None,
+            "media_id": str(photo.id),
+            "extension": ".jpg",
+        }
+
+    if message.file:
+        return {
+            "title": message.file.name,
+            "media_id": str(message.file.id) if message.file.id else None,
+            "extension": message.file.ext,
+        }
+
+    return None
+
+
 ######################################################
 
 
@@ -71,7 +115,12 @@ async def download_content_by_name(channels, limit):
     # Start from the last checkpoint
     print("Number of channels to search: ", len(channels))
 
-    with ChargingBar("Downloading content", max=len(channels)) as bar:
+    with tqdm(
+        total=len(channels),
+        desc="Channels",
+        unit="ch",
+        ascii=True,
+    ) as channels_progress:
         for channel in channels:
             try:
                 channel_peer = await client.get_input_entity(channel)
@@ -102,50 +151,72 @@ async def download_content_by_name(channels, limit):
                 media = {}
                 messages = {}
 
-                async for message in client.iter_messages(channel, limit=limit):
-                    message_date = datetime.datetime.timestamp(message.date)
-                    message_author = get_peer_id(message.from_id)[0]
+                if limit is None or limit == -1:
+                    effective_limit = None
+                else:
+                    effective_limit = limit
 
-                    is_forwarded = False
-                    forwarded_from_id = None
-                    forwarded_message_date = None
-                    if message.forward:
-                        is_forwarded = True
-                        forwarded_from_id = get_peer_id(message.forward.from_id)[0]
-                        forwarded_message_date = datetime.datetime.timestamp(
-                            message.forward.date
-                        )
+                with tqdm(
+                    total=(
+                        effective_limit
+                        if effective_limit and effective_limit > 0
+                        else None
+                    ),
+                    desc="Messages",
+                    unit="msg",
+                    ascii=True,
+                    leave=False,
+                ) as messages_progress:
+                    async for message in client.iter_messages(channel, limit=limit, wait_time=2):
+                        message_dt = message.date
+                        if message_dt.tzinfo is None:
+                            message_dt = message_dt.replace(
+                                tzinfo=datetime.timezone.utc
+                            )
+                        message_date = message_dt.timestamp()
+                        if message_date < STOP_BEFORE_TIMESTAMP:
+                            print(
+                                "[OK] Reached stop-before date, stopping channel crawl"
+                            )
+                            break
 
-                    if message.text:
-                        messages[message.id] = {
-                            "message": message.text,
-                            "date": message_date,
-                            "author": message_author,
-                            "is_forwarded": is_forwarded,
-                            "forwarded_from_id": forwarded_from_id,
-                            "forwarded_message_date": forwarded_message_date,
-                        }
+                        message_author = get_peer_id(message.from_id)[0]
 
-                        time.sleep(0.00001)
+                        is_forwarded = False
+                        forwarded_from_id = None
+                        forwarded_message_date = None
+                        if message.forward:
+                            is_forwarded = True
+                            forwarded_from_id = get_peer_id(message.forward.from_id)[0]
+                            forwarded_message_date = datetime.datetime.timestamp(
+                                message.forward.date
+                            )
 
-                    if message.media and message.file:
-                        if not (message.gif or message.sticker):
-                            title = message.file.name
-                            file_id = message.file.id
-                            file_ext = message.file.ext
-
-                            media[message.id] = {
-                                "title": title,
+                        if message.text:
+                            messages[message.id] = {
+                                "message": message.text,
                                 "date": message_date,
                                 "author": message_author,
-                                "extension": file_ext,
                                 "is_forwarded": is_forwarded,
                                 "forwarded_from_id": forwarded_from_id,
-                                "media_id": file_id,
                                 "forwarded_message_date": forwarded_message_date,
                             }
 
-                            time.sleep(0.00001)
+
+                        media_info = extract_media_info(message)
+                        if media_info:
+                            media[message.id] = {
+                                "title": media_info["title"],
+                                "date": message_date,
+                                "author": message_author,
+                                "extension": media_info["extension"],
+                                "is_forwarded": is_forwarded,
+                                "forwarded_from_id": forwarded_from_id,
+                                "media_id": media_info["media_id"],
+                                "forwarded_message_date": forwarded_message_date,
+                            }
+
+                        messages_progress.update(1)
 
                 # insert all to the end
                 new_ch = {
@@ -170,10 +241,10 @@ async def download_content_by_name(channels, limit):
                 print("Private channel")
                 logging.warning("error with this channel " + str(channel))
 
-            bar.next()
+            channels_progress.update(1)
 
 
-async def main():
+async def main(seed_file=None):
     await client.start()
     # Ensure you're authorized
     if not await client.is_user_authorized():
@@ -184,12 +255,34 @@ async def main():
             await client.sign_in(password=input("Password: "))
 
     # client.flood_sleep_threshold = 0  # Don't auto-sleep
-    channels_to_find = db_utilities.get_other_channels_references(DB_NAME)
+    if seed_file:
+        try:
+            channels_to_find = parse_seed_file(seed_file)
+        except FileNotFoundError:
+            print(f"[FAIL] Seed file not found: {seed_file}")
+            return
+
+        if not channels_to_find:
+            print(f"[FAIL] Seed file is empty: {seed_file}")
+            return
+    else:
+        channels_to_find = db_utilities.get_other_channels_references(DB_NAME)
 
     while channels_to_find.__len__() > 0:
         save_as_pickle(channels_to_find, "channels_to_find")
-        await download_content_by_name(channels_to_find, 10000)
+        await download_content_by_name(channels_to_find, None)
 
 
-with client:
-    client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Crawler (old) with optional seed channel list"
+    )
+    parser.add_argument(
+        "--seed-file",
+        default=None,
+        help="Path to a file containing seed channels (one per line)",
+    )
+    args = parser.parse_args()
+
+    with client:
+        client.loop.run_until_complete(main(args.seed_file))
