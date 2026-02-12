@@ -1,16 +1,153 @@
 import json
+import os
+import pickle
+from pathlib import Path
+
 import ijson
+import networkx as nx
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
-import gridfs
 from tqdm import tqdm
-import os
-from pathlib import Path
-import pickle
-import networkx as nx
 
 # MongoDB URI
 uri = os.environ.get("MONGO_DB_URL", "mongodb://localhost:27017")
+
+
+def insert_execution_context(context_doc, db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Execution.insert_one(context_doc)
+
+
+def update_execution_context(context_uuid, updates, db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Execution.update_one({"_id": context_uuid}, {"$set": updates})
+
+
+def get_execution_context(context_uuid, db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        return db.Execution.find_one({"_id": context_uuid})
+
+
+def list_execution_contexts(db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        return list(db.Execution.find({}).sort("started_at", -1))
+
+
+def insert_discovered_channel(
+    channel_id, execution_uuid, db_name="Telegram", distance=None
+):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        set_fields = {"execution": execution_uuid, "_status": "unprocessed"}
+        if distance is not None:
+            set_fields["_distance"] = distance
+
+        db.Channel.update_one(
+            {"_id": channel_id},
+            {
+                "$set": set_fields,
+                "$setOnInsert": {
+                    "creation_date": 0,
+                    "username": "",
+                    "title": "",
+                    "description": "",
+                    "scam": False,
+                    "verified": False,
+                    "n_subscribers": 0,
+                },
+            },
+            upsert=True,
+        )
+
+
+def update_channel_status(channel_id, execution_uuid, status, db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Channel.update_one(
+            {"_id": channel_id},
+            {"$set": {"execution": execution_uuid, "_status": status}},
+        )
+
+
+def get_next_unprocessed_channel(execution_uuid, db_name="Telegram"):
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        doc = db.Channel.find_one(
+            {"execution": execution_uuid, "_status": "unprocessed"},
+            sort=[("_distance", 1), ("_id", 1)],
+        )
+        if doc:
+            return doc["_id"]
+        return None
+
+
+def get_channel(channel_id, execution_uuid, db_name="Telegram"):
+    """Get channel document by ID without loading messages/media."""
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        return db.Channel.find_one({"_id": channel_id, "execution": execution_uuid})
+
+
+def update_channel_distance(channel_id, execution_uuid, distance, db_name="Telegram"):
+    """Update channel distance to the given value."""
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Channel.update_one(
+            {"_id": channel_id, "execution": execution_uuid},
+            {
+                "$set": {
+                    "_distance": distance,
+                }
+            },
+        )
+
+
+def insert_text_message(
+    channel_id,
+    execution_uuid,
+    message_id,
+    message_doc,
+    db_name="Telegram_test",
+):
+    message_key = f"{channel_id}:{execution_uuid}:{message_id}"
+    payload = message_doc.copy()
+    payload.update(
+        {
+            "_id": message_key,
+            "channel_id": channel_id,
+            "execution": execution_uuid,
+            "message_id": message_id,
+        }
+    )
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.TextMessage.update_one({"_id": message_key}, {"$set": payload}, upsert=True)
+
+
+def insert_media_item(
+    channel_id,
+    execution_uuid,
+    message_id,
+    media_doc,
+    db_name="Telegram_test",
+):
+    media_key = f"{channel_id}:{execution_uuid}:{message_id}"
+    payload = media_doc.copy()
+    payload.update(
+        {
+            "_id": media_key,
+            "channel_id": channel_id,
+            "execution": execution_uuid,
+            "message_id": message_id,
+        }
+    )
+    with MongoClient(uri) as client:
+        db = client[db_name]
+        db.Media.update_one({"_id": media_key}, {"$set": payload}, upsert=True)
 
 
 # ----------------------------------------------------------------------
@@ -130,15 +267,16 @@ def export_networkx_from_mongoDB(db_name="Telegram", include_channel_info=False)
 # Parameters:
 #   - new_channel -> new channel to insert
 #   - db_name -> specify the name of the collection in MongoDB
-def insert_channel(new_channel, db_name="Telegram_test"):
-    text_messages = new_channel.get("text_messages", {}).copy()
+def insert_channel(new_channel, db_name="Telegram_test", execution_uuid=None):
+    if execution_uuid:
+        new_channel["execution"] = execution_uuid
+    if "_status" not in new_channel:
+        new_channel["_status"] = "processed"
     new_channel.pop("text_messages", None)
-    generic_media = new_channel.get("generic_media", {}).copy()
     new_channel.pop("generic_media", None)
 
     with MongoClient(uri) as client:
         db = client[db_name]
-        fs = gridfs.GridFS(db)
         channel = db.Channel
         try:
             channel.insert_one(new_channel)
@@ -154,62 +292,88 @@ def insert_channel(new_channel, db_name="Telegram_test"):
                         "scam": new_channel["scam"],
                         "verified": new_channel["verified"],
                         "n_subscribers": new_channel["n_subscribers"],
+                        "execution": new_channel.get("execution"),
+                        "_status": new_channel.get("_status"),
                     },
-                    "$unset": {"generic_media": ""},
                 },
             )
-
-        if fs.exists(new_channel["_id"]):
-            fs.delete(new_channel["_id"])
-        fs.put(pickle.dumps(text_messages), _id=new_channel["_id"])
-
-        media_id = f"{new_channel['_id']}_media"
-        if fs.exists(media_id):
-            fs.delete(media_id)
-        fs.put(pickle.dumps(generic_media), _id=media_id)
 
 
 # Return the text messages of target channel
 # Parameters:
 #   - id_channel -> ID of the channel from which return the text messages
 #   - db_name -> specify the name of the collection in MongoDB
-def get_text_messages_by_id_ch(id_channel, db_name="Telegram_test"):
+def get_text_messages_by_id_ch(
+    id_channel, db_name="Telegram_test", execution_uuid=None
+):
     with MongoClient(uri) as client:
         db = client[db_name]
-        fs = gridfs.GridFS(db)
-        stream = fs.get(id_channel).read()
+        if execution_uuid is None:
+            return {}
+        cursor = db.TextMessage.find(
+            {"channel_id": id_channel, "execution": execution_uuid}
+        )
+        messages = {}
+        for doc in cursor:
+            message_id = doc.get("message_id")
+            if message_id is None:
+                continue
+            message = doc.copy()
+            message.pop("_id", None)
+            message.pop("channel_id", None)
+            message.pop("execution", None)
+            message.pop("message_id", None)
+            messages[message_id] = message
 
-        return pickle.loads(stream)
+        return messages
 
 
 # Return the generic media of target channel
 # Parameters:
 #   - id_channel -> ID of the channel from which return the generic media
 #   - db_name -> specify the name of the collection in MongoDB
-def get_generic_media_by_id_ch(id_channel, db_name="Telegram_test"):
+def get_generic_media_by_id_ch(
+    id_channel, db_name="Telegram_test", execution_uuid=None
+):
     with MongoClient(uri) as client:
         db = client[db_name]
-        fs = gridfs.GridFS(db)
-        media_id = f"{id_channel}_media"
-        if not fs.exists(media_id):
+        if execution_uuid is None:
             return {}
-        stream = fs.get(media_id).read()
+        cursor = db.Media.find({"channel_id": id_channel, "execution": execution_uuid})
+        media = {}
+        for doc in cursor:
+            message_id = doc.get("message_id")
+            if message_id is None:
+                continue
+            entry = doc.copy()
+            entry.pop("_id", None)
+            entry.pop("channel_id", None)
+            entry.pop("execution", None)
+            entry.pop("message_id", None)
+            media[message_id] = entry
 
-        return pickle.loads(stream)
+        return media
 
 
 # Return the channel with ID id_channel
 # Parameters:
 #   - id_channel -> ID of channel to return
+#   - execution_uuid -> execution context UUID to filter by
 #   - db_name -> specify the name of the collection in MongoDB
-def get_channel_by_id(id_channel, db_name="Telegram_test"):
+def get_channel_by_id(id_channel, execution_uuid, db_name="Telegram_test"):
     ch = {}
     with MongoClient(uri) as client:
         db = client[db_name]
-        ch = db.Channel.find_one({"_id": id_channel})
-        ch["text_messages"] = get_text_messages_by_id_ch(id_channel, db_name)
+        ch = db.Channel.find_one({"_id": id_channel, "execution": execution_uuid})
+        if ch is None:
+            return None
+        ch["text_messages"] = get_text_messages_by_id_ch(
+            id_channel, db_name, execution_uuid
+        )
         if "generic_media" not in ch:
-            ch["generic_media"] = get_generic_media_by_id_ch(id_channel, db_name)
+            ch["generic_media"] = get_generic_media_by_id_ch(
+                id_channel, db_name, execution_uuid
+            )
         ch["_id"] = int(ch["_id"])
 
     return ch
@@ -218,15 +382,22 @@ def get_channel_by_id(id_channel, db_name="Telegram_test"):
 # Return the channel with target username
 # Parameters:
 #   - username -> username of the channel to return
+#   - execution_uuid -> execution context UUID to filter by
 #   - db_name -> specify the name of the collection in MongoDB
-def get_channel_by_username(username, db_name="Telegram_test"):
+def get_channel_by_username(username, execution_uuid, db_name="Telegram_test"):
     ch = {}
     with MongoClient(uri) as client:
         db = client[db_name]
-        ch = db.Channel.find_one({"username": username})
-        ch["text_messages"] = get_text_messages_by_id_ch(ch["_id"], db_name)
+        ch = db.Channel.find_one({"username": username, "execution": execution_uuid})
+        if ch is None:
+            return None
+        ch["text_messages"] = get_text_messages_by_id_ch(
+            ch["_id"], db_name, execution_uuid
+        )
         if "generic_media" not in ch:
-            ch["generic_media"] = get_generic_media_by_id_ch(ch["_id"], db_name)
+            ch["generic_media"] = get_generic_media_by_id_ch(
+                ch["_id"], db_name, execution_uuid
+            )
         ch["_id"] = int(ch["_id"])
 
     return ch
@@ -235,16 +406,23 @@ def get_channel_by_username(username, db_name="Telegram_test"):
 # Return the channels with ID belonging to the given list of IDs
 # Parameters:
 #   - ids_channels -> IDs list of channels to return
+#   - execution_uuid -> execution context UUID to filter by
 #   - db_name -> specify the name of the collection in MongoDB
-def get_channels_by_ids(ids_channels, db_name="Telegram_test"):
+def get_channels_by_ids(ids_channels, execution_uuid, db_name="Telegram_test"):
     chs = []
     with MongoClient(uri) as client:
         db = client[db_name]
 
-        for ch in db.Channel.find({"_id": {"$in": ids_channels}}):
-            ch["text_messages"] = get_text_messages_by_id_ch(ch["_id"], db_name)
+        for ch in db.Channel.find(
+            {"_id": {"$in": ids_channels}, "execution": execution_uuid}
+        ):
+            ch["text_messages"] = get_text_messages_by_id_ch(
+                ch["_id"], db_name, execution_uuid
+            )
             if "generic_media" not in ch:
-                ch["generic_media"] = get_generic_media_by_id_ch(ch["_id"], db_name)
+                ch["generic_media"] = get_generic_media_by_id_ch(
+                    ch["_id"], db_name, execution_uuid
+                )
             ch["_id"] = int(ch["_id"])
             chs.append(ch)
 
@@ -254,10 +432,13 @@ def get_channels_by_ids(ids_channels, db_name="Telegram_test"):
 # Return the channel ID of all the channels stored in MongoDB
 # Parameters:
 #   - db_name -> specify the name of the collection in MongoDB
-def get_channel_ids(db_name="Telegram_test"):
+def get_channel_ids(db_name="Telegram_test", execution_uuid=None):
     with MongoClient(uri) as client:
         db = client[db_name]
-        ids = [ch["_id"] for ch in db.Channel.find({}, {"_id": 1})]
+        query = {}
+        if execution_uuid:
+            query["execution"] = execution_uuid
+        ids = [ch["_id"] for ch in db.Channel.find(query, {"_id": 1})]
     return ids
 
 
@@ -385,11 +566,16 @@ def export_channels_from_mongoDB(
         for ch in cursor:
             channel_id = int(ch["_id"])
             channel_doc = db.Channel.find_one({"_id": channel_id})
-            text_messages = get_text_messages_by_id_ch(channel_id, db_name)
+            execution_uuid = channel_doc.get("execution")
+            text_messages = get_text_messages_by_id_ch(
+                channel_id, db_name, execution_uuid
+            )
             if "generic_media" in channel_doc:
                 generic_media = channel_doc["generic_media"]
             else:
-                generic_media = get_generic_media_by_id_ch(channel_id, db_name)
+                generic_media = get_generic_media_by_id_ch(
+                    channel_id, db_name, execution_uuid
+                )
 
             export_doc = {
                 "creation_date": channel_doc.get("creation_date", 0),
@@ -432,13 +618,11 @@ def export_channels_from_mongoDB(
         print(f"[OK] Total exported channels: {total_count}")
 
 
-
-
 # Return the IDs of the new channels to search during the snowball approach
 # Parameters:
 #   - db_name -> specify the name of the collection in MongoDB
-def get_other_channels_references(db_name="Telegram"):
-    old_references = get_channel_ids(db_name)
+def get_other_channels_references(db_name="Telegram", execution_uuid=None):
+    old_references = get_channel_ids(db_name, execution_uuid)
     print("Total number of channels in the db: ", len(old_references))
 
     path = Path("channels_to_find")
@@ -453,25 +637,38 @@ def get_other_channels_references(db_name="Telegram"):
     with MongoClient(uri) as client:
         db = client[db_name]
 
-        for ch in db.Channel.find({"_id": {"$in": last_checked_channels}}):
-            ch["text_messages"] = get_text_messages_by_id_ch(int(ch["_id"]), db_name)
-            ch["_id"] = int(ch["_id"])
+        channel_query = {"_id": {"$in": last_checked_channels}}
+        if execution_uuid:
+            channel_query["execution"] = execution_uuid
 
-            texts = ch["text_messages"]
-            media = ch.get("generic_media")
-            if media is None:
-                media = get_generic_media_by_id_ch(ch["_id"], db_name)
+        if execution_uuid is None:
+            return []
 
-            new_references |= {
-                texts[key]["forwarded_from_id"]
-                for key in texts.keys()
-                if texts[key]["is_forwarded"]
-            }
-            new_references |= {
-                media[key]["forwarded_from_id"]
-                for key in media.keys()
-                if media[key]["is_forwarded"]
-            }
+        for ch in db.Channel.find(channel_query):
+            ch_id = int(ch["_id"])
+            for doc in db.TextMessage.find(
+                {
+                    "channel_id": ch_id,
+                    "execution": execution_uuid,
+                    "is_forwarded": True,
+                },
+                {"forwarded_from_id": 1},
+            ):
+                forwarded_id = doc.get("forwarded_from_id")
+                if forwarded_id is not None:
+                    new_references.add(forwarded_id)
+
+            for doc in db.Media.find(
+                {
+                    "channel_id": ch_id,
+                    "execution": execution_uuid,
+                    "is_forwarded": True,
+                },
+                {"forwarded_from_id": 1},
+            ):
+                forwarded_id = doc.get("forwarded_from_id")
+                if forwarded_id is not None:
+                    new_references.add(forwarded_id)
 
     new_references = list(new_references.difference(old_references))
 
