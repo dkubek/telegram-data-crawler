@@ -129,6 +129,15 @@ async def download_content_by_name(limit, execution_uuid):
             channel_id_for_status = None
             try:
                 channel_peer = await client.get_input_entity(channel)
+                
+                # Validate that the entity is actually a channel
+                if not isinstance(channel_peer, types.InputPeerChannel):
+                    peer_type = type(channel_peer).__name__
+                    print(f"[SKIP] Entity {channel} is not a channel (type: {peer_type}), marking as skipped")
+                    db_utilities.update_channel_status(channel, execution_uuid, "skipped", DB_NAME)
+                    channels_progress.update(1)
+                    continue
+                
                 channel = channel_peer.channel_id
                 channel_id_for_status = channel
                 channel_connect = await client.get_entity(channel)
@@ -203,29 +212,32 @@ async def download_content_by_name(limit, execution_uuid):
                             )
 
                         if forwarded_from_id:
-                            new_distance = current_distance + 1
-                            existing_channel = db_utilities.get_channel(
-                                forwarded_from_id, execution_uuid, DB_NAME
-                            )
-                            existing_channel_distance = (
-                                existing_channel.get("_distance")
-                                if existing_channel
-                                else float("inf")
-                            )
-                            if existing_channel is not None:
-                                db_utilities.update_channel_distance(
-                                    forwarded_from_id,
-                                    execution_uuid,
-                                    min(new_distance, existing_channel_distance),
-                                    DB_NAME,
+                            # Validate that the forwarded entity is actually a channel before storing
+                            forwarded_peer = await client.get_input_entity(forwarded_from_id)
+                            if isinstance(forwarded_peer, types.InputPeerChannel):
+                                new_distance = current_distance + 1
+                                existing_channel = db_utilities.get_channel(
+                                    forwarded_from_id, execution_uuid, DB_NAME
                                 )
-                            else:
-                                db_utilities.insert_discovered_channel(
-                                    forwarded_from_id,
-                                    execution_uuid,
-                                    DB_NAME,
-                                    distance=new_distance,
+                                existing_channel_distance = (
+                                    existing_channel.get("_distance")
+                                    if existing_channel
+                                    else float("inf")
                                 )
+                                if existing_channel is not None:
+                                    db_utilities.update_channel_distance(
+                                        forwarded_from_id,
+                                        execution_uuid,
+                                        min(new_distance, existing_channel_distance),
+                                        DB_NAME,
+                                    )
+                                else:
+                                    db_utilities.insert_discovered_channel(
+                                        forwarded_from_id,
+                                        execution_uuid,
+                                        DB_NAME,
+                                        distance=new_distance,
+                                    )
 
                         if message.text:
                             db_utilities.insert_text_message(

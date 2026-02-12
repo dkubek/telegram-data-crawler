@@ -74,6 +74,7 @@ def update_channel_status(channel_id, execution_uuid, status, db_name="Telegram"
 
 
 def get_next_unprocessed_channel(execution_uuid, db_name="Telegram"):
+    """Get next unprocessed channel, skipping entries with negative IDs (likely users/chats)."""
     with MongoClient(uri) as client:
         db = client[db_name]
         doc = db.Channel.find_one(
